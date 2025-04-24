@@ -5,11 +5,48 @@ from typing import Dict, Optional
 from google.cloud.functions import HttpRequest
 from google.cloud.functions import HttpResponse
 from jsonschema import validate, ValidationError
+from enum import Enum
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.ERROR)
+
+class ErrorCode(Enum):
+    METHOD_NOT_ALLOWED = "METHOD_NOT_ALLOWED"
+    BAD_REQUEST = "BAD_REQUEST"
+    INVALID_JSON = "INVALID_JSON"
+    INVALID_REQUEST = "INVALID_REQUEST"
+    MISSING_FIELD = "MISSING_FIELD"
+    INVALID_FIELD_TYPE = "INVALID_FIELD_TYPE"
+    INVALID_FIELD_VALUE = "INVALID_FIELD_VALUE"
+    NOT_FOUND = "NOT_FOUND"
+    INTERNAL_ERROR = "INTERNAL_ERROR"
 
 # In a real application, you would use a database to store and retrieve payment data.
 # Here, we'll use a simple in-memory dictionary for demonstration purposes.
 payments_db: Dict[str, Dict] = {}
 
+def error_response(error_message: str, error_code: ErrorCode, status_code: int, details: Optional[str] = None) -> HttpResponse:
+    """
+    Creates a standardized error response.
+
+    Args:
+        error_message: A human-readable error message.
+        error_code: The error code.
+        status_code: The HTTP status code.
+        details: Optional details about the error.
+
+    Returns:
+        The HTTP response object.
+    """
+    response_body = {"error": error_message, "code": error_code.value}
+    if details:
+        response_body["details"] = details
+    return HttpResponse(
+        json.dumps(response_body),
+        status_code=status_code,
+        headers={"Content-Type": "application/json"}
+    )
 
 def create_payment(request: HttpRequest) -> HttpResponse:
     """
@@ -22,20 +59,14 @@ def create_payment(request: HttpRequest) -> HttpResponse:
         The HTTP response object.
     """
     if request.method != 'POST':
-        return HttpResponse(
-            json.dumps({"error": "Method Not Allowed", "code": "METHOD_NOT_ALLOWED"}),
-            status_code=405,
-            headers={"Content-Type": "application/json"}
-        )
+        return error_response("Method Not Allowed", ErrorCode.METHOD_NOT_ALLOWED, 405)
 
     try:
         request_json = request.get_json(silent=True)
+        if request_json is None:
+            return error_response("Invalid JSON format", ErrorCode.INVALID_JSON, 400, "Request body is not valid JSON")
         if not request_json:
-            return HttpResponse(
-                json.dumps({"error": "Bad Request", "code": "BAD_REQUEST"}),
-                status_code=400,
-                headers={"Content-Type": "application/json"}
-            )
+            return error_response("Bad Request", ErrorCode.BAD_REQUEST, 400, "Request body is empty")
 
         # Define the JSON schema for validation
         payment_request_schema = {
@@ -64,23 +95,25 @@ def create_payment(request: HttpRequest) -> HttpResponse:
         )
 
     except ValidationError as e:
-        return HttpResponse(
-            json.dumps({"error": "Invalid request body", "code": "INVALID_REQUEST", "details": e.message}),
-            status_code=400,
-            headers={"Content-Type": "application/json"}
-        )
+        if e.validator == "required":
+            error_code = ErrorCode.MISSING_FIELD
+            details = f"Missing required field: {', '.join(e.path)}"
+        elif e.validator == "type":
+            error_code = ErrorCode.INVALID_FIELD_TYPE
+            details = f"Invalid type for field '{e.path[-1]}'. Expected {e.validator_value}, got {e.instance.__class__.__name__}"
+        elif e.validator == "minimum":
+            error_code = ErrorCode.INVALID_FIELD_VALUE
+            details = f"Invalid value for field '{e.path[-1]}'. Minimum value is {e.validator_value}"
+        else:
+            error_code = ErrorCode.INVALID_REQUEST
+            details = e.message
+
+        return error_response("Invalid request body", error_code, 400, details)
     except ValueError as e:
-        return HttpResponse(
-            json.dumps({"error": "Invalid JSON format", "code": "INVALID_JSON", "details": str(e)}),
-            status_code=400,
-            headers={"Content-Type": "application/json"}
-        )
+        return error_response("Invalid JSON format", ErrorCode.INVALID_JSON, 400, str(e))
     except Exception as e:
-        return HttpResponse(
-            json.dumps({"error": "An unexpected error occurred.", "code": "INTERNAL_ERROR", "details": str(e)}),
-            status_code=500,
-            headers={"Content-Type": "application/json"}
-        )
+        logging.exception("An unexpected error occurred.")
+        return error_response("An unexpected error occurred.", ErrorCode.INTERNAL_ERROR, 500, str(e))
 
 
 def get_payment(request: HttpRequest, payment_id: str) -> HttpResponse:
@@ -95,11 +128,7 @@ def get_payment(request: HttpRequest, payment_id: str) -> HttpResponse:
         The HTTP response object.
     """
     if request.method != 'GET':
-        return HttpResponse(
-            json.dumps({"error": "Method Not Allowed", "code": "METHOD_NOT_ALLOWED"}),
-            status_code=405,
-            headers={"Content-Type": "application/json"}
-        )
+        return error_response("Method Not Allowed", ErrorCode.METHOD_NOT_ALLOWED, 405)
 
     payment = payments_db.get(payment_id)
     if payment:
@@ -109,11 +138,7 @@ def get_payment(request: HttpRequest, payment_id: str) -> HttpResponse:
             headers={"Content-Type": "application/json"}
         )
     else:
-        return HttpResponse(
-            json.dumps({"error": "Payment not found", "code": "NOT_FOUND"}),
-            status_code=404,
-            headers={"Content-Type": "application/json"}
-        )
+        return error_response("Payment not found", ErrorCode.NOT_FOUND, 404)
 
 
 def create_payment_response(payment_request: Dict) -> Dict:
@@ -155,8 +180,4 @@ def main(request: HttpRequest) -> HttpResponse:
         payment_id = request.path.split("/")[-1]
         return get_payment(request, payment_id)
     else:
-        return HttpResponse(
-            json.dumps({"error": "Not Found", "code": "NOT_FOUND"}),
-            status_code=404,
-            headers={"Content-Type": "application/json"}
-        )
+        return error_response("Not Found", ErrorCode.NOT_FOUND, 404)
